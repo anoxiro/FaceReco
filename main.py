@@ -67,6 +67,14 @@ class FaceTracker:
             os.makedirs(person_dir)
         return person_dir
 
+    def identify_face(self, face_encoding):
+        """Identifie une personne et retourne son ID et son statut"""
+        matching_face = self.find_matching_face(face_encoding)
+        if matching_face is None:
+            return None, "Inconnu"
+        _, person_id = self.saved_faces[tuple(matching_face)]
+        return person_id, "Connu"
+
     def find_matching_face(self, face_encoding):
         if not self.face_encodings:
             return None
@@ -92,7 +100,7 @@ class FaceTracker:
     def update_face(self, face_encoding, person_id):
         self.face_encodings.append(face_encoding)
         self.saved_faces[tuple(face_encoding)] = (datetime.now(), person_id)
-        self._save_known_faces()  # Sauvegarder après chaque nouveau visage
+        self._save_known_faces()
 
     def get_saved_count(self):
         return len(set(person_id for _, person_id in self.saved_faces.values()))
@@ -119,6 +127,31 @@ def process_frame(frame, scale=0.25):
     
     return face_locations_original, face_encodings
 
+def draw_face_info(frame, face_location, face_encoding, face_tracker):
+    """Dessine les informations du visage sur l'image"""
+    top, right, bottom, left = face_location
+    
+    # Identifier la personne
+    person_id, recognition_status = face_tracker.identify_face(face_encoding)
+    
+    # Couleur du rectangle selon le statut
+    if recognition_status == "Connu":
+        color = (0, 255, 0)  # Vert pour les visages connus
+        display_text = f"ID #{person_id}"
+    else:
+        color = (0, 165, 255)  # Orange pour les inconnus
+        display_text = "Inconnu"
+    
+    # Dessiner le rectangle et l'ID
+    cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
+    
+    # Afficher l'ID au-dessus du rectangle
+    font = cv2.FONT_HERSHEY_DUPLEX
+    cv2.putText(frame, display_text, (left + 6, top - 6),
+                font, 0.6, color, 1)
+    
+    return frame
+
 def save_detected_face(frame, face_location, face_encoding, face_tracker):
     top, right, bottom, left = face_location
     face_img = frame[top:bottom, left:right]
@@ -131,10 +164,10 @@ def save_detected_face(frame, face_location, face_encoding, face_tracker):
         filename = f"{timestamp}.jpg"
         
         if matching_face is None:
-            status = f"Nouvelle personne #{person_id}"
+            status = "Photo sauvegardée"
             face_tracker.update_face(face_encoding, person_id)
         else:
-            status = f"Personne #{person_id} reconnue"
+            status = "Photo sauvegardée"
             face_tracker.saved_faces[tuple(matching_face)] = (datetime.now(), person_id)
             face_tracker._save_known_faces()
         
@@ -173,16 +206,19 @@ def main():
             face_locations, face_encodings = process_frame(frame)
             
             for face_location, face_encoding in zip(face_locations, face_encodings):
-                top, right, bottom, left = face_location
-                cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
+                # Dessiner les informations du visage
+                frame = draw_face_info(frame, face_location, face_encoding, face_tracker)
                 
+                # Sauvegarder la photo si possible
                 saved, status = save_detected_face(frame, face_location, face_encoding, face_tracker)
-                status_color = (0, 255, 0) if saved else (0, 165, 255)
-                
-                cv2.putText(frame, status, (left, top - 10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 2)
+                if saved:
+                    # Afficher le statut de sauvegarde en bas du rectangle
+                    top, right, bottom, left = face_location
+                    cv2.putText(frame, status, (left, bottom + 20),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
             
-            cv2.putText(frame, f'Personnes uniques: {face_tracker.get_saved_count()}', 
+            # Afficher le nombre total de personnes connues
+            cv2.putText(frame, f'Base de données: {face_tracker.get_saved_count()} personnes', 
                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             
             cv2.imshow("Detection Faciale", frame)
