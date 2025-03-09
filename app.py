@@ -34,7 +34,19 @@ class FaceTracker:
 
     def _initialize_cnn_pool(self):
         if self._cnn_pool is None and self.detection_model == "cnn":
-            self._cnn_pool = multiprocessing.Pool(processes=1)
+            # Détecter si nous sommes sur un Mac M1/M2
+            try:
+                import platform
+                is_arm = platform.processor() == 'arm'
+                if is_arm:
+                    # Sur M1/M2, utiliser moins de processus mais plus de threads
+                    self._cnn_pool = multiprocessing.Pool(processes=2)
+                else:
+                    # Sur d'autres architectures, utiliser plus de processus
+                    self._cnn_pool = multiprocessing.Pool(processes=4)
+            except:
+                # Par défaut, utiliser un seul processus
+                self._cnn_pool = multiprocessing.Pool(processes=1)
         elif self.detection_model == "hog" and self._cnn_pool is not None:
             self._cnn_pool.close()
             self._cnn_pool.join()
@@ -187,6 +199,17 @@ class FaceTracker:
     def _process_frame(self, frame, scale=0.25):
         # Convertir en RGB pour face_recognition
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # Ajuster l'échelle selon le mode et l'architecture
+        if self.detection_model == "cnn":
+            try:
+                import platform
+                is_arm = platform.processor() == 'arm'
+                if is_arm:
+                    # Sur M1/M2, on peut utiliser une échelle plus grande
+                    scale = 0.4
+            except:
+                pass
         
         # Créer plusieurs versions de l'image avec différentes rotations légères
         frames_to_process = [
