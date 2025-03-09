@@ -13,6 +13,7 @@ import signal
 import multiprocessing
 import multiprocessing.util
 from multiprocessing import freeze_support
+import time
 
 app = Flask(__name__)
 CORS(app)
@@ -29,8 +30,9 @@ class FaceTracker:
         self.save_photos = False
         self.person_count = 0
         self.detection_model = "hog"
-        self._cnn_pool = None
-        self._cnn_context = None  # Contexte pour le multiprocessing
+        self._last_cnn_time = 0
+        self._cnn_interval = 1.0  # Augmenter l'intervalle à 1 seconde
+        self._cnn_enabled = False  # Flag pour désactiver complètement le CNN si nécessaire
         self._load_known_faces()
         self.video_capture = cv2.VideoCapture(0)
         self.person_count = self._get_last_person_id()
@@ -245,34 +247,72 @@ class FaceTracker:
     def _process_frame(self, frame, scale=0.25):
         try:
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            # Ajuster l'échelle selon le mode
+            if self.detection_model == "cnn":
+                scale = 0.1  # Réduire encore plus pour CNN
+            
+            # Redimensionner l'image
             small_frame = cv2.resize(rgb_frame, (0, 0), fx=scale, fy=scale)
             
-            # Détection des visages
-            if self.detection_model == "cnn" and self._cnn_pool is not None:
-                try:
-                    # Utiliser apply_async avec timeout
-                    async_result = self._cnn_pool.apply_async(
-                        face_recognition.face_locations,
-                        args=(small_frame,),
-                        kwds={'model': 'cnn', 'number_of_times_to_upsample': 1}
-                    )
-                    face_locations = async_result.get(timeout=2.0)
-                except Exception as e:
-                    print(f"Erreur CNN, retour à HOG: {e}")
-                    self.detection_model = "hog"
+            current_time = time.time()
+            
+            try:
+                if self.detection_model == "cnn" and not self._cnn_enabled:
+                    # Premier essai avec CNN
+                    try:
+                        face_recognition.face_locations(
+                            small_frame,
+                            model="cnn",
+                            number_of_times_to_upsample=1
+                        )
+                        self._cnn_enabled = True
+                        print("Mode CNN activé avec succès")
+                    except Exception as e:
+                        print(f"CNN non supporté sur cette machine: {e}")
+                        self.detection_model = "hog"
+                        self._cnn_enabled = False
+                
+                if self.detection_model == "cnn" and self._cnn_enabled:
+                    if current_time - self._last_cnn_time >= self._cnn_interval:
+                        try:
+                            face_locations = face_recognition.face_locations(
+                                small_frame,
+                                model="cnn",
+                                number_of_times_to_upsample=1
+                            )
+                            self._last_cnn_time = current_time
+                        except Exception as e:
+                            print(f"Erreur CNN, retour à HOG: {e}")
+                            face_locations = face_recognition.face_locations(
+                                small_frame,
+                                model="hog",
+                                number_of_times_to_upsample=1
+                            )
+                    else:
+                        face_locations = face_recognition.face_locations(
+                            small_frame,
+                            model="hog",
+                            number_of_times_to_upsample=1
+                        )
+                else:
                     face_locations = face_recognition.face_locations(
                         small_frame,
                         model="hog",
                         number_of_times_to_upsample=1
                     )
-            else:
+                
+            except Exception as e:
+                print(f"Erreur de détection: {str(e)}")
+                self.detection_model = "hog"
+                self._cnn_enabled = False
                 face_locations = face_recognition.face_locations(
                     small_frame,
                     model="hog",
                     number_of_times_to_upsample=1
                 )
             
-            # Encodage des visages
+            # Encodage des visages avec paramètres réduits
             face_encodings = face_recognition.face_encodings(
                 small_frame, 
                 face_locations,
@@ -289,7 +329,11 @@ class FaceTracker:
             return face_locations_original, face_encodings
             
         except Exception as e:
-            print(f"Erreur lors du traitement de l'image: {e}")
+            print(f"Erreur générale lors du traitement de l'image: {str(e)}")
+            if self.detection_model == "cnn":
+                print("Désactivation du mode CNN suite à une erreur")
+                self.detection_model = "hog"
+                self._cnn_enabled = False
             return [], []
 
     def _process_face(self, frame, face_location, face_encoding):
@@ -325,22 +369,28 @@ class FaceTracker:
             new_model = "cnn" if self.detection_model == "hog" else "hog"
             print(f"Changement de mode: {self.detection_model} -> {new_model}")
             
-            # Nettoyer les ressources actuelles
-            self._cleanup_cnn_resources()
+            if new_model == "cnn" and not self._cnn_enabled:
+                print("Test de compatibilité CNN...")
+                try:
+                    # Test avec une petite image
+                    test_frame = np.zeros((100, 100, 3), dtype=np.uint8)
+                    face_recognition.face_locations(test_frame, model="cnn")
+                    self._cnn_enabled = True
+                    print("Mode CNN compatible")
+                except Exception as e:
+                    print(f"Mode CNN non supporté: {e}")
+                    return False
             
-            # Changer le mode
             self.detection_model = new_model
-            
-            # Initialiser le nouveau pool si nécessaire
-            if new_model == "cnn":
-                self._initialize_cnn_pool()
+            self._last_cnn_time = 0
             
             print(f"Mode changé avec succès: {self.detection_model}")
             return True
+            
         except Exception as e:
-            print(f"Erreur lors du changement de mode: {e}")
-            self._cleanup_cnn_resources()
+            print(f"Erreur lors du changement de mode: {str(e)}")
             self.detection_model = "hog"
+            self._cnn_enabled = False
             print("Retour forcé au mode HOG")
             return False
 
@@ -460,7 +510,7 @@ if __name__ == '__main__':
         signal.signal(signal.SIGTERM, cleanup_resources)
         
         # Démarrer l'application Flask
-        app.run(debug=False, use_reloader=False)  # Désactiver le reloader aussi
+        app.run(debug=False, use_reloader=False, threaded=True)
     except Exception as e:
         print(f"Erreur lors du démarrage: {e}")
         cleanup_resources()
