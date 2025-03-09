@@ -11,6 +11,8 @@ from flask_cors import CORS
 import atexit
 import signal
 import multiprocessing
+import multiprocessing.util
+from multiprocessing import freeze_support
 
 app = Flask(__name__)
 CORS(app)
@@ -25,32 +27,49 @@ class FaceTracker:
         self.tolerance = tolerance
         self.db_conn = self._initialize_database()
         self.save_photos = False
-        self.person_count = 0  # Initialiser à 0 avant de charger
-        self.detection_model = "hog"  # Mode par défaut
+        self.person_count = 0
+        self.detection_model = "hog"
+        self._cnn_pool = None
+        self._cnn_context = None  # Contexte pour le multiprocessing
         self._load_known_faces()
         self.video_capture = cv2.VideoCapture(0)
-        self.person_count = self._get_last_person_id()  # Mettre à jour après le chargement
-        self._cnn_pool = None
+        self.person_count = self._get_last_person_id()
 
     def _initialize_cnn_pool(self):
-        if self._cnn_pool is None and self.detection_model == "cnn":
-            # Détecter si nous sommes sur un Mac M1/M2
+        """Initialise le contexte et le pool CNN de manière sécurisée"""
+        try:
+            # Nettoyer les anciennes ressources si elles existent
+            self._cleanup_cnn_resources()
+            
+            # Créer un nouveau pool uniquement si en mode CNN
+            if self.detection_model == "cnn":
+                try:
+                    self._cnn_context = multiprocessing.get_context('spawn')
+                    self._cnn_pool = self._cnn_context.Pool(processes=1)
+                    print("Mode CNN initialisé avec succès")
+                except Exception as e:
+                    print(f"Erreur lors de l'initialisation du pool CNN: {e}")
+                    self._cleanup_cnn_resources()
+                    self.detection_model = "hog"
+                    print("Retour au mode HOG suite à une erreur")
+        except Exception as e:
+            print(f"Erreur lors de l'initialisation du mode CNN: {e}")
+            self._cleanup_cnn_resources()
+            self.detection_model = "hog"
+            print("Retour au mode HOG suite à une erreur")
+
+    def _cleanup_cnn_resources(self):
+        """Nettoie proprement les ressources CNN"""
+        if self._cnn_pool is not None:
             try:
-                import platform
-                is_arm = platform.processor() == 'arm'
-                if is_arm:
-                    # Sur M1/M2, utiliser moins de processus mais plus de threads
-                    self._cnn_pool = multiprocessing.Pool(processes=2)
-                else:
-                    # Sur d'autres architectures, utiliser plus de processus
-                    self._cnn_pool = multiprocessing.Pool(processes=4)
+                self._cnn_pool.terminate()
+                self._cnn_pool.join(timeout=0.5)
             except:
-                # Par défaut, utiliser un seul processus
-                self._cnn_pool = multiprocessing.Pool(processes=1)
-        elif self.detection_model == "hog" and self._cnn_pool is not None:
-            self._cnn_pool.close()
-            self._cnn_pool.join()
-            self._cnn_pool = None
+                pass
+            finally:
+                self._cnn_pool = None
+                
+        self._cnn_context = None
 
     def _initialize_database(self):
         conn = sqlite3.connect('faces.db', check_same_thread=False)
@@ -66,34 +85,61 @@ class FaceTracker:
         return conn
 
     def _get_last_person_id(self):
-        # Vérifier dans la base de données
-        c = self.db_conn.cursor()
-        c.execute('SELECT MAX(id) FROM personnes')
-        db_max = c.fetchone()[0]
-        
-        # Vérifier dans les encodages sauvegardés
-        saved_max = max([pid for _, pid in self.saved_faces.values()]) if self.saved_faces else 0
-        
-        # Vérifier dans les dossiers
-        person_dirs = [d for d in os.listdir(self.base_dir) 
-                      if os.path.isdir(os.path.join(self.base_dir, d)) 
-                      and d.startswith("personne_")]
-        dir_max = max([int(d.split("_")[1]) for d in person_dirs]) if person_dirs else 0
-        
-        # Retourner le maximum des trois sources
-        return max(filter(None, [db_max, saved_max, dir_max, 0]))
+        try:
+            # Vérifier dans la base de données
+            c = self.db_conn.cursor()
+            c.execute('SELECT MAX(id) FROM personnes')
+            db_max = c.fetchone()[0]
+            if db_max is None:
+                db_max = 0
+            
+            # Vérifier dans les encodages sauvegardés
+            saved_max = 0
+            if self.saved_faces:
+                saved_ids = [pid for _, pid in self.saved_faces.values()]
+                if saved_ids:
+                    saved_max = max(saved_ids)
+            
+            # Vérifier dans les dossiers
+            dir_max = 0
+            try:
+                person_dirs = [d for d in os.listdir(self.base_dir) 
+                             if os.path.isdir(os.path.join(self.base_dir, d)) 
+                             and d.startswith("personne_")]
+                if person_dirs:
+                    dir_ids = [int(d.split("_")[1]) for d in person_dirs]
+                    if dir_ids:
+                        dir_max = max(dir_ids)
+            except (ValueError, IndexError):
+                pass
+            
+            # Retourner le maximum des trois sources
+            return max(db_max, saved_max, dir_max, 0)
+        except Exception as e:
+            print(f"Erreur lors de la récupération du dernier ID: {e}")
+            return 0
 
     def __del__(self):
         self.cleanup()
 
     def cleanup(self):
+        """Nettoyage propre des ressources"""
+        # Nettoyer les ressources CNN
+        self._cleanup_cnn_resources()
+
+        # Fermer la base de données
         if hasattr(self, 'db_conn'):
-            self.db_conn.close()
+            try:
+                self.db_conn.close()
+            except:
+                pass
+
+        # Libérer la caméra
         if hasattr(self, 'video_capture'):
-            self.video_capture.release()
-        if hasattr(self, '_cnn_pool') and self._cnn_pool is not None:
-            self._cnn_pool.close()
-            self._cnn_pool.join()
+            try:
+                self.video_capture.release()
+            except:
+                pass
 
     def _load_known_faces(self):
         if os.path.exists(self.encodings_file):
@@ -197,105 +243,54 @@ class FaceTracker:
         return jpeg.tobytes(), detections
 
     def _process_frame(self, frame, scale=0.25):
-        # Convertir en RGB pour face_recognition
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
-        # Ajuster l'échelle selon le mode et l'architecture
-        if self.detection_model == "cnn":
-            try:
-                import platform
-                is_arm = platform.processor() == 'arm'
-                if is_arm:
-                    # Sur M1/M2, on peut utiliser une échelle plus grande
-                    scale = 0.4
-            except:
-                pass
-        
-        # Créer plusieurs versions de l'image avec différentes rotations légères
-        frames_to_process = [
-            rgb_frame,  # Image originale
-        ]
-        
-        # Ajouter les rotations uniquement en mode CNN pour plus de précision
-        if self.detection_model == "cnn":
-            frames_to_process.extend([
-                cv2.rotate(rgb_frame, cv2.ROTATE_90_CLOCKWISE),  # Rotation 90°
-                cv2.rotate(rgb_frame, cv2.ROTATE_90_COUNTERCLOCKWISE),  # Rotation -90°
-            ])
-        
-        all_face_locations = []
-        all_face_encodings = []
-
         try:
-            self._initialize_cnn_pool()
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            small_frame = cv2.resize(rgb_frame, (0, 0), fx=scale, fy=scale)
             
-            for idx, process_frame in enumerate(frames_to_process):
-                # Redimensionner pour la performance
-                small_frame = cv2.resize(process_frame, (0, 0), fx=scale, fy=scale)
-                
-                # Utiliser le modèle sélectionné avec gestion du pool pour CNN
-                if self.detection_model == "cnn" and self._cnn_pool is not None:
-                    face_locations = self._cnn_pool.apply(
+            # Détection des visages
+            if self.detection_model == "cnn" and self._cnn_pool is not None:
+                try:
+                    # Utiliser apply_async avec timeout
+                    async_result = self._cnn_pool.apply_async(
                         face_recognition.face_locations,
                         args=(small_frame,),
-                        kwds={'model': self.detection_model, 'number_of_times_to_upsample': 1}
+                        kwds={'model': 'cnn', 'number_of_times_to_upsample': 1}
                     )
-                else:
+                    face_locations = async_result.get(timeout=2.0)
+                except Exception as e:
+                    print(f"Erreur CNN, retour à HOG: {e}")
+                    self.detection_model = "hog"
                     face_locations = face_recognition.face_locations(
                         small_frame,
-                        model=self.detection_model,
+                        model="hog",
                         number_of_times_to_upsample=1
                     )
-                
-                # Ajuster les paramètres selon le mode
-                num_jitters = 2 if self.detection_model == "cnn" else 1
-                face_encodings = face_recognition.face_encodings(
-                    small_frame, 
-                    face_locations,
-                    num_jitters=num_jitters
+            else:
+                face_locations = face_recognition.face_locations(
+                    small_frame,
+                    model="hog",
+                    number_of_times_to_upsample=1
                 )
-                
-                # Reconvertir les coordonnées à l'échelle originale
-                face_locations_original = []
-                for top, right, bottom, left in face_locations:
-                    # Ajuster les coordonnées selon la rotation
-                    if self.detection_model == "cnn" and idx == 1:  # Rotation 90°
-                        new_top = left
-                        new_right = top
-                        new_bottom = right
-                        new_left = bottom
-                    elif self.detection_model == "cnn" and idx == 2:  # Rotation -90°
-                        new_top = right
-                        new_right = bottom
-                        new_bottom = left
-                        new_left = top
-                    else:  # Pas de rotation
-                        new_top, new_right, new_bottom, new_left = top, right, bottom, left
-                    
-                    # Mettre à l'échelle originale
-                    face_locations_original.append((
-                        int(new_top/scale),
-                        int(new_right/scale),
-                        int(new_bottom/scale),
-                        int(new_left/scale)
-                    ))
-                
-                all_face_locations.extend(face_locations_original)
-                all_face_encodings.extend(face_encodings)
-
+            
+            # Encodage des visages
+            face_encodings = face_recognition.face_encodings(
+                small_frame, 
+                face_locations,
+                num_jitters=1
+            )
+            
+            # Reconvertir les coordonnées
+            face_locations_original = [
+                (int(top/scale), int(right/scale), 
+                 int(bottom/scale), int(left/scale))
+                for top, right, bottom, left in face_locations
+            ]
+            
+            return face_locations_original, face_encodings
+            
         except Exception as e:
             print(f"Erreur lors du traitement de l'image: {e}")
             return [], []
-        
-        # Supprimer les doublons potentiels
-        unique_faces = {}
-        for loc, enc in zip(all_face_locations, all_face_encodings):
-            # Utiliser le centre du visage comme clé pour éviter les doublons
-            center = ((loc[0] + loc[2])//2, (loc[1] + loc[3])//2)
-            if center not in unique_faces:
-                unique_faces[center] = (loc, enc)
-        
-        return list(face[0] for face in unique_faces.values()), list(face[1] for face in unique_faces.values())
 
     def _process_face(self, frame, face_location, face_encoding):
         top, right, bottom, left = face_location
@@ -324,6 +319,31 @@ class FaceTracker:
     def get_saved_count(self):
         return len(set(person_id for _, person_id in self.saved_faces.values()))
 
+    def toggle_detection_model(self):
+        """Change le mode de détection de manière sécurisée"""
+        try:
+            new_model = "cnn" if self.detection_model == "hog" else "hog"
+            print(f"Changement de mode: {self.detection_model} -> {new_model}")
+            
+            # Nettoyer les ressources actuelles
+            self._cleanup_cnn_resources()
+            
+            # Changer le mode
+            self.detection_model = new_model
+            
+            # Initialiser le nouveau pool si nécessaire
+            if new_model == "cnn":
+                self._initialize_cnn_pool()
+            
+            print(f"Mode changé avec succès: {self.detection_model}")
+            return True
+        except Exception as e:
+            print(f"Erreur lors du changement de mode: {e}")
+            self._cleanup_cnn_resources()
+            self.detection_model = "hog"
+            print("Retour forcé au mode HOG")
+            return False
+
 def gen_frames(face_tracker):
     while True:
         frame_bytes, detections = face_tracker.get_frame()
@@ -345,9 +365,15 @@ def create_face_tracker():
     face_tracker = FaceTracker(storage_dir)
 
 def cleanup_resources(signum=None, frame=None):
+    """Nettoyage propre des ressources au shutdown"""
     global face_tracker
     if face_tracker is not None:
-        face_tracker.cleanup()
+        try:
+            face_tracker.cleanup()
+        except:
+            pass
+        finally:
+            face_tracker = None
 
 # Enregistrer les gestionnaires de nettoyage
 atexit.register(cleanup_resources)
@@ -378,8 +404,9 @@ def toggle_save_photos():
 
 @app.route('/toggle_detection_model', methods=['POST'])
 def toggle_detection_model():
-    face_tracker.detection_model = "cnn" if face_tracker.detection_model == "hog" else "hog"
+    success = face_tracker.toggle_detection_model()
     return jsonify({
+        'success': success,
         'detection_model': face_tracker.detection_model
     })
 
@@ -414,4 +441,28 @@ def shutdown():
     return jsonify({'success': True, 'message': 'Serveur arrêté'})
 
 if __name__ == '__main__':
-    app.run(debug=True) 
+    try:
+        # Configuration du multiprocessing
+        multiprocessing.freeze_support()
+        multiprocessing.set_start_method('spawn', force=True)
+        
+        # Créer le dossier de stockage
+        storage_dir = "faces"
+        if not os.path.exists(storage_dir):
+            os.makedirs(storage_dir)
+        
+        # Initialiser le FaceTracker
+        create_face_tracker()
+        
+        # Enregistrer les gestionnaires de nettoyage
+        atexit.register(cleanup_resources)
+        signal.signal(signal.SIGINT, cleanup_resources)
+        signal.signal(signal.SIGTERM, cleanup_resources)
+        
+        # Démarrer l'application Flask
+        app.run(debug=False, use_reloader=False)  # Désactiver le reloader aussi
+    except Exception as e:
+        print(f"Erreur lors du démarrage: {e}")
+        cleanup_resources()
+    finally:
+        cleanup_resources() 
