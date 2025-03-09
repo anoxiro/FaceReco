@@ -45,7 +45,13 @@ class FaceTracker:
         self.min_delay = timedelta(seconds=min_delay_seconds)
         self.tolerance = tolerance
         self.db_conn = initialize_database()
+        self.save_photos = False  # Mode de sauvegarde des photos désactivé par défaut
         self._load_known_faces()
+
+    def toggle_photo_saving(self):
+        """Active/désactive la sauvegarde des photos"""
+        self.save_photos = not self.save_photos
+        return self.save_photos
 
     def __del__(self):
         """Ferme la connexion à la base de données"""
@@ -60,6 +66,14 @@ class FaceTracker:
             VALUES (?, ?, ?)
         ''', (person_id, prenom, nom))
         self.db_conn.commit()
+
+    def add_new_face(self, face_encoding):
+        """Ajoute un nouveau visage sans photo"""
+        self.person_count += 1
+        self.face_encodings.append(face_encoding)
+        self.saved_faces[tuple(face_encoding)] = (datetime.now(), self.person_count)
+        self._save_known_faces()
+        return self.person_count
 
     def get_person_info(self, person_id):
         """Récupère les informations d'une personne"""
@@ -118,6 +132,33 @@ class FaceTracker:
             os.makedirs(person_dir)
         return person_dir
 
+    def process_face(self, frame, face_location, face_encoding):
+        """Traite un visage détecté (identification et sauvegarde si activée)"""
+        top, right, bottom, left = face_location
+        person_id, person_info = self.identify_face(face_encoding)
+        status = None
+
+        if person_id is None:
+            # Nouveau visage détecté
+            person_id = self.add_new_face(face_encoding)
+            status = "Nouvelle personne détectée"
+        elif self.save_photos:
+            # Visage connu, sauvegarder la photo si le mode est activé
+            current_time = datetime.now()
+            last_capture, _ = self.saved_faces[tuple(self.find_matching_face(face_encoding))]
+            if (current_time - last_capture) >= self.min_delay:
+                if self.save_photos:
+                    person_dir = self.get_person_directory(person_id)
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                    filename = f"{timestamp}.jpg"
+                    filepath = os.path.join(person_dir, filename)
+                    face_img = frame[top:bottom, left:right]
+                    cv2.imwrite(filepath, face_img)
+                    status = "Photo sauvegardée"
+                self.saved_faces[tuple(self.find_matching_face(face_encoding))] = (current_time, person_id)
+
+        return person_id, person_info, status
+
     def identify_face(self, face_encoding):
         """Identifie une personne et retourne son ID et son statut"""
         matching_face = self.find_matching_face(face_encoding)
@@ -137,22 +178,6 @@ class FaceTracker:
         if face_distances[best_match_index] <= self.tolerance:
             return self.face_encodings[best_match_index]
         return None
-
-    def can_save_face(self, face_encoding):
-        matching_face = self.find_matching_face(face_encoding)
-        if matching_face is None:
-            self.person_count += 1
-            return True, None, self.person_count
-        
-        current_time = datetime.now()
-        last_capture, person_id = self.saved_faces[tuple(matching_face)]
-        can_save = (current_time - last_capture) >= self.min_delay
-        return can_save, matching_face, person_id
-
-    def update_face(self, face_encoding, person_id):
-        self.face_encodings.append(face_encoding)
-        self.saved_faces[tuple(face_encoding)] = (datetime.now(), person_id)
-        self._save_known_faces()
 
     def get_saved_count(self):
         return len(set(person_id for _, person_id in self.saved_faces.values()))
@@ -179,56 +204,30 @@ def process_frame(frame, scale=0.25):
     
     return face_locations_original, face_encodings
 
-def draw_face_info(frame, face_location, face_encoding, face_tracker):
+def draw_face_info(frame, face_location, person_id, person_info, status=None):
     """Dessine les informations du visage sur l'image"""
     top, right, bottom, left = face_location
-    
-    # Identifier la personne
-    person_id, person_info = face_tracker.identify_face(face_encoding)
     
     # Couleur du rectangle selon le statut
     if person_id is not None:
         color = (0, 255, 0)  # Vert pour les visages connus
-        display_text = person_info
     else:
         color = (0, 165, 255)  # Orange pour les inconnus
-        display_text = "Inconnu"
     
     # Dessiner le rectangle et l'info
     cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
     
     # Afficher le nom/ID au-dessus du rectangle
     font = cv2.FONT_HERSHEY_DUPLEX
-    cv2.putText(frame, display_text, (left + 6, top - 6),
+    cv2.putText(frame, person_info, (left + 6, top - 6),
                 font, 0.6, color, 1)
     
+    # Afficher le status si présent
+    if status:
+        cv2.putText(frame, status, (left, bottom + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+    
     return frame
-
-def save_detected_face(frame, face_location, face_encoding, face_tracker):
-    top, right, bottom, left = face_location
-    face_img = frame[top:bottom, left:right]
-    
-    can_save, matching_face, person_id = face_tracker.can_save_face(face_encoding)
-    
-    if can_save:
-        person_dir = face_tracker.get_person_directory(person_id)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        filename = f"{timestamp}.jpg"
-        
-        if matching_face is None:
-            status = "Nouvelle personne détectée"
-            face_tracker.update_face(face_encoding, person_id)
-        else:
-            status = "Photo sauvegardée"
-            face_tracker.saved_faces[tuple(matching_face)] = (datetime.now(), person_id)
-            face_tracker._save_known_faces()
-        
-        filepath = os.path.join(person_dir, filename)
-        cv2.imwrite(filepath, face_img)
-        return True, status
-    else:
-        seconds = face_tracker.get_time_until_next_capture(face_encoding)
-        return False, f"Attente: {seconds}s"
 
 def handle_keyboard_input(face_tracker):
     """Gère les entrées clavier pour l'ajout/modification des noms"""
@@ -247,6 +246,9 @@ def handle_keyboard_input(face_tracker):
             print("ID invalide")
         except Exception as e:
             print(f"Erreur: {e}")
+    elif key == ord('s'):  # 's' pour activer/désactiver la sauvegarde des photos
+        is_saving = face_tracker.toggle_photo_saving()
+        print(f"Sauvegarde des photos {'activée' if is_saving else 'désactivée'}")
     
     return True
 
@@ -264,6 +266,8 @@ def main():
         print("Commandes:")
         print("  'q' pour quitter")
         print("  'a' pour ajouter/modifier le nom d'une personne")
+        print("  's' pour activer/désactiver la sauvegarde des photos")
+        print(f"Mode actuel: {'Sauvegarde photos activée' if face_tracker.save_photos else 'Identification seule'}")
         
         while True:
             ret, frame = video_capture.read()
@@ -279,15 +283,12 @@ def main():
             face_locations, face_encodings = process_frame(frame)
             
             for face_location, face_encoding in zip(face_locations, face_encodings):
-                frame = draw_face_info(frame, face_location, face_encoding, face_tracker)
-                
-                saved, status = save_detected_face(frame, face_location, face_encoding, face_tracker)
-                if saved:
-                    top, right, bottom, left = face_location
-                    cv2.putText(frame, status, (left, bottom + 20),
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                person_id, person_info, status = face_tracker.process_face(frame, face_location, face_encoding)
+                frame = draw_face_info(frame, face_location, person_id, person_info, status)
             
-            cv2.putText(frame, f'Base de données: {face_tracker.get_saved_count()} personnes', 
+            mode_text = "Mode: Sauvegarde photos" if face_tracker.save_photos else "Mode: Identification seule"
+            cv2.putText(frame, mode_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(frame, f'Personnes connues: {face_tracker.get_saved_count()}', 
                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             
             cv2.imshow("Detection Faciale", frame)
