@@ -3,7 +3,7 @@ import cv2
 import numpy as np
 from datetime import datetime, timedelta
 import os
-import hashlib
+import pickle
 
 def initialize_camera():
     camera = cv2.VideoCapture(0)
@@ -20,14 +20,15 @@ def create_storage_directory():
 class FaceTracker:
     def __init__(self, base_dir, min_delay_seconds=5, tolerance=0.6):
         self.base_dir = base_dir
+        self.encodings_file = os.path.join(base_dir, "known_faces.pkl")
         self.saved_faces = {}  # encoding -> (dernière_capture, person_id)
-        self.face_encodings = []  # Liste des encodings connus
-        self.person_count = self._get_last_person_id()  # Récupérer le dernier ID utilisé
+        self.face_encodings = []
+        self.person_count = self._get_last_person_id()
         self.min_delay = timedelta(seconds=min_delay_seconds)
         self.tolerance = tolerance
+        self._load_known_faces()
 
     def _get_last_person_id(self):
-        # Récupérer le dernier ID utilisé en scannant les dossiers existants
         person_dirs = [d for d in os.listdir(self.base_dir) 
                       if os.path.isdir(os.path.join(self.base_dir, d)) 
                       and d.startswith("personne_")]
@@ -35,6 +36,30 @@ class FaceTracker:
             return 0
         person_ids = [int(d.split("_")[1]) for d in person_dirs]
         return max(person_ids)
+
+    def _load_known_faces(self):
+        if os.path.exists(self.encodings_file):
+            try:
+                with open(self.encodings_file, 'rb') as f:
+                    data = pickle.load(f)
+                    self.face_encodings = data['encodings']
+                    self.saved_faces = data['saved_faces']
+                    print(f"Chargement de {len(self.face_encodings)} visages connus")
+            except Exception as e:
+                print(f"Erreur lors du chargement des visages connus: {e}")
+                self.face_encodings = []
+                self.saved_faces = {}
+
+    def _save_known_faces(self):
+        try:
+            with open(self.encodings_file, 'wb') as f:
+                data = {
+                    'encodings': self.face_encodings,
+                    'saved_faces': self.saved_faces
+                }
+                pickle.dump(data, f)
+        except Exception as e:
+            print(f"Erreur lors de la sauvegarde des visages connus: {e}")
 
     def get_person_directory(self, person_id):
         person_dir = os.path.join(self.base_dir, f"personne_{person_id}")
@@ -67,9 +92,10 @@ class FaceTracker:
     def update_face(self, face_encoding, person_id):
         self.face_encodings.append(face_encoding)
         self.saved_faces[tuple(face_encoding)] = (datetime.now(), person_id)
+        self._save_known_faces()  # Sauvegarder après chaque nouveau visage
 
     def get_saved_count(self):
-        return self.person_count
+        return len(set(person_id for _, person_id in self.saved_faces.values()))
 
     def get_time_until_next_capture(self, face_encoding):
         matching_face = self.find_matching_face(face_encoding)
@@ -101,8 +127,6 @@ def save_detected_face(frame, face_location, face_encoding, face_tracker):
     
     if can_save:
         person_dir = face_tracker.get_person_directory(person_id)
-        
-        # Format de date: YYYYMMDD_HHMMSS_microseconds
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         filename = f"{timestamp}.jpg"
         
@@ -110,8 +134,9 @@ def save_detected_face(frame, face_location, face_encoding, face_tracker):
             status = f"Nouvelle personne #{person_id}"
             face_tracker.update_face(face_encoding, person_id)
         else:
-            status = f"Personne #{person_id}"
+            status = f"Personne #{person_id} reconnue"
             face_tracker.saved_faces[tuple(matching_face)] = (datetime.now(), person_id)
+            face_tracker._save_known_faces()
         
         filepath = os.path.join(person_dir, filename)
         cv2.imwrite(filepath, face_img)
@@ -157,7 +182,7 @@ def main():
                 cv2.putText(frame, status, (left, top - 10),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 2)
             
-            cv2.putText(frame, f'Personnes détectées: {face_tracker.get_saved_count()}', 
+            cv2.putText(frame, f'Personnes uniques: {face_tracker.get_saved_count()}', 
                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             
             cv2.imshow("Detection Faciale", frame)
