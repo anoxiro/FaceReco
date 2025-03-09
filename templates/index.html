@@ -46,6 +46,21 @@
         .button.active {
             background-color: #28a745;
         }
+        .button.cnn {
+            background-color: #dc3545;
+        }
+        .button.cnn.active {
+            background-color: #c82333;
+        }
+        .button.danger {
+            background-color: #dc3545;
+        }
+        .button.danger:hover {
+            background-color: #c82333;
+        }
+        .button.danger:active {
+            background-color: #bd2130;
+        }
         .stats {
             margin-top: 20px;
             padding: 10px;
@@ -93,6 +108,17 @@
             border: 1px solid #ddd;
             border-radius: 4px;
         }
+        .shutdown-container {
+            margin-top: 20px;
+            padding: 20px;
+            background-color: #fff3f3;
+            border-radius: 5px;
+            border: 1px solid #dc3545;
+        }
+        .shutdown-container p {
+            color: #dc3545;
+            margin-bottom: 10px;
+        }
     </style>
 </head>
 <body>
@@ -106,12 +132,20 @@
 
         <div class="controls">
             <button id="toggle-save" class="button">Activer la sauvegarde des photos</button>
+            <button id="toggle-model" class="button">Mode HOG</button>
             <button id="add-person" class="button">Ajouter une personne</button>
         </div>
 
         <div class="stats">
             <p>Personnes détectées: <span id="person-count">0</span></p>
-            <p>Mode: <span id="current-mode">Identification seule</span></p>
+            <p>Mode de sauvegarde: <span id="current-mode">Identification seule</span></p>
+            <p>Mode de détection: <span id="detection-mode">HOG</span></p>
+        </div>
+
+        <div class="shutdown-container">
+            <p><strong>Zone de danger</strong></p>
+            <p>Attention: Cette action arrêtera complètement le serveur de reconnaissance faciale.</p>
+            <button id="shutdown" class="button danger">Arrêter le programme</button>
         </div>
     </div>
 
@@ -140,12 +174,14 @@
         const overlay = document.getElementById('overlay');
         const video = document.getElementById('video-feed');
         const toggleSaveBtn = document.getElementById('toggle-save');
+        const toggleModelBtn = document.getElementById('toggle-model');
         const addPersonBtn = document.getElementById('add-person');
         const modal = document.getElementById('add-person-modal');
         const modalBackdrop = document.getElementById('modal-backdrop');
         const personForm = document.getElementById('person-form');
         const personCount = document.getElementById('person-count');
         const currentMode = document.getElementById('current-mode');
+        const detectionMode = document.getElementById('detection-mode');
 
         // Ajuster la taille du canvas overlay à la vidéo
         function resizeOverlay() {
@@ -205,8 +241,12 @@
                 const stats = await response.json();
                 personCount.textContent = stats.total_persons;
                 currentMode.textContent = stats.save_photos ? 'Sauvegarde photos' : 'Identification seule';
+                detectionMode.textContent = stats.detection_model.toUpperCase();
                 toggleSaveBtn.textContent = stats.save_photos ? 'Désactiver la sauvegarde' : 'Activer la sauvegarde';
+                toggleModelBtn.textContent = `Mode ${stats.detection_model.toUpperCase()}`;
                 toggleSaveBtn.classList.toggle('active', stats.save_photos);
+                toggleModelBtn.classList.toggle('cnn', stats.detection_model === 'cnn');
+                toggleModelBtn.classList.toggle('active', stats.detection_model === 'cnn');
             } catch (error) {
                 console.error('Erreur lors de la mise à jour des stats:', error);
             }
@@ -219,6 +259,16 @@
                 updateStats();
             } catch (error) {
                 console.error('Erreur lors du changement de mode:', error);
+            }
+        });
+
+        // Gestion du mode de détection
+        toggleModelBtn.addEventListener('click', async () => {
+            try {
+                await fetch('/toggle_detection_model', { method: 'POST' });
+                updateStats();
+            } catch (error) {
+                console.error('Erreur lors du changement de mode de détection:', error);
             }
         });
 
@@ -263,6 +313,23 @@
             } catch (error) {
                 console.error('Erreur lors de l\'ajout de la personne:', error);
                 alert('Erreur lors de l\'ajout de la personne');
+            }
+        });
+
+        // Gestion de l'arrêt du serveur
+        document.getElementById('shutdown').addEventListener('click', async () => {
+            if (confirm('Êtes-vous sûr de vouloir arrêter le programme ? Cette action ne peut pas être annulée.')) {
+                try {
+                    const response = await fetch('/shutdown', { method: 'POST' });
+                    const result = await response.json();
+                    if (result.success) {
+                        alert('Le programme a été arrêté avec succès.');
+                        window.close(); // Tenter de fermer la fenêtre
+                    }
+                } catch (error) {
+                    console.error('Erreur lors de l\'arrêt du programme:', error);
+                    alert('Le programme a été arrêté, mais une erreur est survenue.');
+                }
             }
         });
 
